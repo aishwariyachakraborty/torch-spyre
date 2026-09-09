@@ -75,6 +75,7 @@ def enable_spyre_context(example_inputs: list[InputType]):
         CustomPostFusionPasses,
         CustomPreSchedulingPasses,
     )
+    from torch_spyre._inductor import config as _spyre_config
     from torch_spyre._inductor.propagate_hints import recover_spyre_hints
 
     # *) Inductor config tweaks (saved/restored)
@@ -93,6 +94,15 @@ def enable_spyre_context(example_inputs: list[InputType]):
         "permute_fusion": False,
         "allow_buffer_reuse": False,  # For now, as buffer reuse does not consider stride_map.
         "reorder_for_locality": False,  # Prevents unhinted ops from being moved into hinted regions.
+        # Freezing treats parameters as constants, which lets upstream fold
+        # parameter-only arithmetic at compile time and concatenate the weights
+        # of linears sharing an activation into one wider GEMM. The upstream
+        # gate is device-independent and runs before inner_compile, so the
+        # frozen graph reaches our post-grad passes already folded -- there is
+        # no Spyre-side pass to add. Opt-in via SPYRE_FREEZING=1; inference
+        # only. Absent (rather than False) when disabled so a caller that set
+        # torch._inductor.config.freezing itself is not silently overridden.
+        **({"freezing": True} if _spyre_config.spyre_freezing else {}),
     }
 
     from torch._inductor.ir import Loops

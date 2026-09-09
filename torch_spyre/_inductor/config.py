@@ -237,4 +237,15 @@ _cpsat_warn_on_cost_expr: bool = True
 # torch._inductor.config.force_disable_caches = True.
 spyre_kernel_cache: bool = os.environ.get("SPYRE_KERNEL_CACHE", "0") == "1"
 
+# Enable Inductor freezing on the Spyre compile path. Freezing treats
+# parameters as constants, which licenses upstream's compile-time constant
+# folding and freezing-time weight concatenation (the q/k/v and gate/up
+# projections of a decoder layer fuse into one wider GEMM each). The upstream
+# gate is device-independent, so no Spyre-side pass is needed -- the frozen
+# graph simply arrives at our post-grad hooks already folded.
+# Inference only, and off by default: freezing is not reversible within a
+# process once parameters have been discarded.
+# Set SPYRE_FREEZING=1 to enable.
+spyre_freezing: bool = os.environ.get("SPYRE_FREEZING", "0") == "1"
+
 install_config_module(sys.modules[__name__])
