@@ -26,12 +26,22 @@ import torch
 
 from torch._inductor import config as t_inductor_config
 from torch._inductor.graph import GraphLowering
+from torch._inductor.ir import (
+    ComputedBuffer,
+    FixedLayout,
+    MutationLayoutSHOULDREMOVE,
+    Pointwise,
+    ReinterpretView,
+    StorageBox,
+    TensorBox,
+)
 
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 from torch_spyre._inductor import passes
 from torch_spyre._inductor import config as ts_inductor_config
 from torch_spyre._inductor.pass_utils import op_read_writes
 from torch_spyre._inductor.patches import enable_spyre_context
+from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
 from torch_spyre._inductor.scratchpad.utils import calculate_liveness
 
 try:
@@ -52,6 +62,47 @@ _Splits = tuple[tuple[tuple[int, int], ...], tuple[tuple[int, int], ...]]
 _AllocEntry = tuple[str, int, _Splits]
 
 
+def _graph_editor_test_buffer(name: str) -> ComputedBuffer:
+    device = torch.device("spyre")
+    return ComputedBuffer(
+        name=name,
+        layout=FixedLayout(device, torch.float16, [2, 3]),
+        data=Pointwise(
+            device=device,
+            dtype=torch.float16,
+            inner_fn=lambda _i0, _i1: 0,
+            ranges=[2, 3],
+        ),
+    )
+
+
+def test_change_graph_output_skips_unrelated_view_and_preserves_matching_view():
+    old = _graph_editor_test_buffer("old")
+    new = _graph_editor_test_buffer("new")
+    unrelated = _graph_editor_test_buffer("unrelated")
+    view_layout = FixedLayout(
+        torch.device("spyre"), torch.float16, [3, 2], [1, 3], offset=1
+    )
+    view = ReinterpretView(data=StorageBox(old), layout=view_layout)
+    output = TensorBox(StorageBox(view))
+    unrelated_view = ReinterpretView(
+        data=StorageBox(unrelated), layout=unrelated.layout
+    )
+    unrelated_output = TensorBox(StorageBox(unrelated_view))
+    lowering = SimpleNamespace(graph_outputs=[unrelated_output, output])
+    editor = object.__new__(GraphEditor)
+    editor.lowering = lowering
+
+    editor.change_graph_output(old, new)
+
+    assert lowering.graph_outputs[0] is unrelated_output
+    assert unrelated_view.data.data is unrelated
+    assert lowering.graph_outputs[1] is output
+    assert output.data.data is view
+    assert view.layout is view_layout
+    assert view.data.data is new
+
+
 def test_nested_spyre_context_runs_pre_scheduling_once():
     calls = []
 
@@ -69,6 +120,30 @@ def test_nested_spyre_context_runs_pre_scheduling_once():
         GraphLowering._update_scheduler(graph)
 
     assert calls == [graph]
+
+
+def test_cooptimizing_allocator_rejects_relayout_results_without_asserts():
+    """Unsupported paired plans remain fail-closed under ``python -O``."""
+
+    import torch_spyre._inductor.cost_model as cost_model_module
+    import torch_spyre._inductor.scratchpad.allocator as allocator_module
+
+    solver = SimpleNamespace(
+        buffers=[],
+        plan_layout_and_core_divisions=lambda _cost: [
+            SimpleNamespace(lx_relayout_plans=[object()])
+        ],
+    )
+    graph = SimpleNamespace(operations=[])
+    with (
+        patch.object(allocator_module, "CoreDivisionLayoutSolver", object),
+        patch.object(allocator_module, "mem_usage_by_buf", return_value={}),
+        patch.object(cost_model_module, "predict_by_bundle", return_value=0),
+        unittest.TestCase().assertRaisesRegex(
+            AssertionError, "CoOptimizingAllocator does not support LX relayout"
+        ),
+    ):
+        allocator_module.CoOptimizingAllocator._solve(SimpleNamespace(), solver, graph)
 
 
 class CustomPreSchedulingPassesWithOurPasses(CustomPreSchedulingPasses):
@@ -159,6 +234,8 @@ class BaseTestScratchpadUsage(unittest.TestCase):
                 buf_name = op.name
                 buffer = graph.get_buffer(buf_name)
                 layout = buffer.get_layout()
+                if isinstance(layout, MutationLayoutSHOULDREMOVE):
+                    layout = layout.real_layout()
                 device_layout = layout.device_layout
                 allocation = getattr(layout, "allocation", {})
                 mem_usages[buf_name] = {
@@ -622,10 +699,10 @@ class TestCloneAtGraphBoundaries(
         """A graph input read by a reduction is LX-cloned, with the clone's
         per-core split re-keyed correctly.
 
-        push_allocation_with_clone re-keys the consumer's op_it_space_splits
-        through the buffer's strides before assigning them to the clone. A reduction consumer's split is keyed to its
-        reduced-shape output; copied verbatim it would split the wrong axis of
-        the full-shape clone (wrong values / SDSC abort at multi-core). The
+        push_allocation_with_clone projects the accepted physical view through
+        the clone's own coordinates and commits that complete division. Copying
+        a reduction consumer's logical split verbatim could split the wrong axis
+        of the full-shape clone (wrong values / SDSC abort at multi-core). The
         numerical failure only manifests when work is split across cores; here
         (sencores=1) we assert the clone is inserted and the result is correct.
         Multi-core numerical coverage lives in

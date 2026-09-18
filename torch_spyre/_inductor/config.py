@@ -83,9 +83,41 @@ ktir_emitter: bool = os.environ.get("TORCH_SPYRE_KTIR", "0") == "1"
 # A .mlir declaring the target device, passed to the backend compiler.
 ktir_device_mlir: str = os.environ.get("KTIR_DEVICE_MLIR", "")
 
-# Materialize compatible producer/consumer LX ownership changes as identity copies.
-# Set SPYRE_LX_PLANNER_RELAYOUT=0 to disable this optimization.
+# Enable certified LX ownership changes: movement, exact fused-axis views,
+# consumer-compatible producer order, and same-core restickify residency.
+# Set SPYRE_LX_PLANNER_RELAYOUT=0 to disable these optional optimizations, not
+# ownership validation. This does not change the allocator or LX memory budget.
 lx_planner_relayout: bool = os.getenv("SPYRE_LX_PLANNER_RELAYOUT", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+# How many destination views the CP-SAT relayout enumeration keeps per
+# (source, consumer) edge, cheapest first: a consumer with many equal-core
+# divisions induces one distinct destination partition (one relayout copy the
+# solver must place) per division, though it will read through at most one.
+# On the spyre_attn decode graph with 16 unrolled KV blocks the unbounded
+# enumeration built 5789 copies and CP-SAT's presolve outlived the time limit.
+# 0 keeps every view.
+lx_solver_relayout_groups_per_edge: int = int(
+    os.getenv("SPYRE_LX_SOLVER_RELAYOUT_GROUPS_PER_EDGE", "4")
+)
+
+# Above this many relayout copies in one CP-SAT solve, run the solver without
+# its presolve. One of CP-SAT's presolve passes scales super-linearly in the
+# number of free copy residency literals (measured on the spyre_attn decode
+# graph: 16 copies 5 s, 64 copies 13 s, 160 copies 40 s, 312 copies past the
+# 120 s limit) and no exposed parameter shortens it, while search on the raw
+# model finds a feasible plan within seconds. 0 never skips presolve.
+lx_solver_relayout_presolve_max_copies: int = int(
+    os.getenv("SPYRE_LX_SOLVER_RELAYOUT_PRESOLVE_MAX_COPIES", "64")
+)
+
+# Submit independent DXP kernel compilations to Inductor's subprocess pool and
+# resolve them together at the generated wrapper's async_compile.wait() barrier.
+# This is opt-in while the parallel path is evaluated on full model compiles.
+async_dxp_compile: bool = os.getenv("SPYRE_ASYNC_DXP_COMPILE", "0").lower() in (
     "1",
     "true",
     "yes",
