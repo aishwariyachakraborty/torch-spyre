@@ -473,6 +473,7 @@ class TestBuildingBlocks(unittest.TestCase):
         dtype=torch.float16,
         name_inputs=False,
         LK=128,
+        kv_padding=0,
         transposed_inputs=False,
         reshape_output=False,
     ):
@@ -500,8 +501,8 @@ class TestBuildingBlocks(unittest.TestCase):
             v = torch.randn(B, LK, N_KV, D, dtype=dtype).transpose(1, 2)
         else:
             q = torch.randn(B, H, LQ, D, dtype=dtype)
-            k = torch.randn(B, N_KV, LK, D, dtype=dtype)
-            v = torch.randn(B, N_KV, LK, D, dtype=dtype)
+            k = torch.randn(B, N_KV, LK + kv_padding, D, dtype=dtype)[:, :, :LK, :]
+            v = torch.randn(B, N_KV, LK + kv_padding, D, dtype=dtype)[:, :, :LK, :]
         query_positions = torch.arange(LK - LQ, LK).view(1, 1, LQ, 1)
         key_positions = torch.arange(LK).view(1, 1, 1, LK)
         mask = torch.where(
@@ -512,12 +513,17 @@ class TestBuildingBlocks(unittest.TestCase):
         self.assertEqual(mask.shape, (B, 1, LQ, LK))
 
         expected = sdpa(q, k, v, mask)
-        q_dev, k_dev, v_dev, mask_dev = (
-            q.to("spyre"),
-            k.to("spyre"),
-            v.to("spyre"),
-            mask.to("spyre"),
-        )
+        q_dev = q.to("spyre")
+        if kv_padding:
+            # Preserve the prefix view on device. Calling k.to("spyre")
+            # directly would make a compact copy and miss the production
+            # static-cache layout this regression covers.
+            k_dev = k._base.to("spyre")[:, :, :LK, :]
+            v_dev = v._base.to("spyre")[:, :, :LK, :]
+        else:
+            k_dev = k.to("spyre")
+            v_dev = v.to("spyre")
+        mask_dev = mask.to("spyre")
         if name_inputs:
             for name, size in (
                 ("_b", B),
@@ -559,7 +565,30 @@ class TestBuildingBlocks(unittest.TestCase):
         """
         self._run_granite_gqa_with_finite_broadcast_mask(LQ=128)
 
+    @mock.patch(
+        "torch_spyre._inductor.decompositions._sdpa_kv_block_sizes",
+        new=lambda _: [64],
+    )
+    @config.patch(
+        {
+            "cpsat_time_limit_seconds": 30,
+        }
+    )
+    def test_granite_gqa_prefill_noncontiguous_kv_prefix(self):
+        """The Lk loop streams a padded cache prefix one tile at a time."""
+        self._run_granite_gqa_with_finite_broadcast_mask(
+            LQ=128,
+            LK=128,
+            kv_padding=64,
+        )
+
     @mock.patch("torch_spyre._inductor.decompositions._SDPA_MAX_SEQUENCE_TILE_SIZE", 64)
+    # patch the cpsat time to bypass the CI job stall timeout
+    @config.patch(
+        {
+            "cpsat_time_limit_seconds": 30,
+        }
+    )
     def test_granite_gqa_prefill_four_by_four_sequence_tiling(self):
         """Exercise Granite's transposed attention inputs and fused consumer."""
         self._run_granite_gqa_with_finite_broadcast_mask(
@@ -571,6 +600,12 @@ class TestBuildingBlocks(unittest.TestCase):
             reshape_output=True,
         )
 
+    # patch the cpsat time to bypass the CI job stall timeout
+    @config.patch(
+        {
+            "cpsat_time_limit_seconds": 30,
+        }
+    )
     def test_siglip_multicrop_attention_span(self):
         """A seven-crop SigLIP prefill must fit each tiled BMM under 256 MB."""
         B, H, L, D = 7, 16, 576, 128
@@ -652,6 +687,55 @@ class TestBuildingBlocks(unittest.TestCase):
             x.to("spyre"), w.to("spyre"), q.to("spyre"), v.to("spyre")
         ).cpu()
         torch.testing.assert_close(actual, expected, atol=0.2, rtol=0.2)
+
+    def test_grouped_sdpa_from_packed_rows(self):
+        """A packed row dimension may be viewed as batch x sequence.
+
+        The per-tile K restickify reads its physical row coordinate as the
+        dense flattening ``L * batch + sequence``.  Input padding must account
+        for all batches instead of assuming one symbol per physical dimension.
+        """
+        heads, head_dim = 12, 64
+        generator = torch.Generator().manual_seed(4676)
+        for group, extent in ((2, 63), (2, 64), (4, 512)):
+            with self.subTest(group=group, extent=extent):
+                rows = group * extent
+                q, k, v = (
+                    torch.randn(
+                        (rows, heads, head_dim),
+                        dtype=torch.float16,
+                        generator=generator,
+                    )
+                    for _ in range(3)
+                )
+                mask = torch.zeros(group, 1, 1, extent, dtype=torch.float16)
+
+                def sdpa_grouped(q_rows, k_rows, v_rows, mask):
+                    def unpack(x):
+                        return x.reshape(group, extent, heads, head_dim).transpose(1, 2)
+
+                    attn = F.scaled_dot_product_attention(
+                        unpack(q_rows),
+                        unpack(k_rows),
+                        unpack(v_rows),
+                        attn_mask=mask,
+                        scale=head_dim**-0.5,
+                    )
+                    return attn.transpose(1, 2).reshape(rows, heads, head_dim)
+
+                expected = sdpa_grouped(q, k, v, mask)
+                actual = torch.compile(sdpa_grouped, fullgraph=True, dynamic=False)(
+                    q.to("spyre"),
+                    k.to("spyre"),
+                    v.to("spyre"),
+                    mask.to("spyre"),
+                ).cpu()
+                torch.testing.assert_close(
+                    actual,
+                    expected,
+                    atol=0.1,
+                    rtol=0.1,
+                )
 
     def test_sdpa_head_tiles_limit_heads_per_tile(self):
         """The hint value is a tile count, not a per-tile head extent."""
