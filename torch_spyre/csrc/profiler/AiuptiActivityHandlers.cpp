@@ -174,6 +174,10 @@ inline std::string runtimeCbidName(AIUpti_runtime_api_trace_cbid cbid) {
       return "aiuIssueCallback";
     case AIUPTI_RUNTIME_TRACE_CBID_VERIFY_ASYC_MSGS:
       return "aiuVerifyAsyncMsgs";
+    case AIUPTI_RUNTIME_TRACE_CBID_AIU_ROUNDTRIP:
+      return "aiuRoundtrip";
+    case AIUPTI_RUNTIME_TRACE_CBID_WAIT_FOR_QUEUE_CAPACITY:
+      return "aiuWaitForQueueCapacity";
     default:
       break;
   }
