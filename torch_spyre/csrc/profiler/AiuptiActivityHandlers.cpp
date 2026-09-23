@@ -20,6 +20,8 @@
 #include <cstring>
 #include <memory>
 #include <nlohmann/json.hpp>
+#include <cstdlib>
+#include <cstring>
 #include <string>
 #include <type_traits>
 #include <unordered_map>
@@ -328,6 +330,12 @@ inline std::string runtimeCbidName(AIUpti_runtime_api_trace_cbid cbid) {
       return "aiuCommsHdmaFirmwareReset";
     case AIUPTI_RUNTIME_TRACE_CBID_WAIT_FOR_QUEUE_CAPACITY:
       return "aiuWaitForQueueCapacity";
+    case AIUPTI_RUNTIME_TRACE_CBID_CMPT_EXEC:
+      return "aiuCmptExec";
+    case AIUPTI_RUNTIME_TRACE_CBID_DMAI_EXEC:
+      return "aiuDmaIExec";
+    case AIUPTI_RUNTIME_TRACE_CBID_DMAO_EXEC:
+      return "aiuDmaOExec";
     default:
       break;
   }
@@ -581,7 +589,6 @@ inline std::string memoryCopyOperationName(uint8_t kind) {
   }
   return "<unknown>";
 }
-
 inline uint32_t getBaseResourceId(const AIUpti_ActivityMemcpy* activity) {
   return activity->copy_kind * 100;
 }
@@ -873,10 +880,10 @@ void AiuptiActivityProfilerSession::handlePtiActivity(
           reinterpret_cast<const AIUpti_ActivityMemory*>(record), logger);
       break;
     default:
-      errors_.push_back("Unexpected activity type: " +
-                        std::to_string(record->kind));
+      errors_.push_back("Unexpected activity type: " + std::to_string(record->kind));
       break;
   }
 }
 
 }  // namespace KINETO_NAMESPACE
+
