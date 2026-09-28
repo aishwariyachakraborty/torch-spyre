@@ -14,10 +14,12 @@
 
 """What SPYRE_FREEZING actually does to the graph Spyre's passes receive.
 
-Runs on the Spyre device, because it has to: the compile_fx wrapper only enters
-``enable_spyre_context`` -- where ``new_config`` and therefore ``freezing`` are
-applied -- when ``_uses_spyre(gm, example_inputs)`` is true
-(torch_spyre/_inductor/__init__.py). On CPU tensors the flag is inert.
+Runs on the Spyre device: the Spyre passes and layouts under test only run when
+``_uses_spyre(gm, example_inputs)`` is true (torch_spyre/_inductor/__init__.py).
+
+Freezing is toggled by patching ``torch._inductor.config.freezing`` around
+``torch.compile`` -- exactly what SPYRE_FREEZING=1 does process-wide at install
+time, and early enough for Dynamo to see it.
 
 The graph is captured by wrapping ``CustomPostPasses.__call__`` rather than by
 patching ``post_grad_custom_post_pass``, since ``new_config`` installs its own
@@ -33,7 +35,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from torch_spyre._inductor import config as spyre_config
+import torch_spyre  # noqa: F401
 from torch_spyre._inductor.passes import CustomPostPasses
 
 DEVICE = "spyre"
@@ -102,11 +104,10 @@ def _compile_and_capture(monkeypatch, mod, example, *, freezing: bool):
     # Without these, a second compile of the same forward reuses Dynamo's cached
     # frame (or an FX/AOT cache entry) and post-grad never runs again.
     torch._dynamo.reset()
-    with spyre_config.patch(spyre_freezing=freezing):
-        with torch._inductor.config.patch(force_disable_caches=True):
-            compiled = torch.compile(mod, backend="inductor")
-            with torch.no_grad():
-                out = compiled(example)
+    with torch._inductor.config.patch(freezing=freezing, force_disable_caches=True):
+        compiled = torch.compile(mod, backend="inductor")
+        with torch.no_grad():
+            out = compiled(example)
 
     monkeypatch.setattr(CustomPostPasses, "__call__", orig_call)
     assert "before" in captured, (

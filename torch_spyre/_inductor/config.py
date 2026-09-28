@@ -90,11 +90,17 @@ disable_conv2d_spatial_split: bool = (
     os.environ.get("SPYRE_INDUCTOR_DISABLE_CONV2D_SPATIAL_SPLIT", "1") == "1"
 )
 
-# Opt-in Inductor freezing. Sets ``config.freezing`` for the compile, which makes
-# ``fw_compiler_freezing`` treat parameters as constants before ``inner_compile``
-# runs -- licensing constant folding of parameter-only subgraphs and concat-linear
-# (several ``mm``/``addmm`` sharing one activation become one wider GEMM against a
-# concatenated constant weight).
+# Opt-in Inductor freezing. Read once, when the compile_fx wrapper is installed
+# (enable_spyre_compile_fx_wrapper), which then sets ``torch._inductor.config.
+# freezing`` process-wide -- it must be on before Dynamo traces, see the comment
+# there. Freezing makes ``fw_compiler_freezing`` treat parameters as constants
+# before ``inner_compile`` runs, licensing constant folding of parameter-only
+# subgraphs and concat-linear (several ``mm``/``addmm`` sharing one activation
+# become one wider GEMM against a concatenated constant weight). Frozen Spyre
+# constants get a FixedTiledLayout from _spyre_tiled_constant_buffers.
+#
+# Set the env var before importing torch_spyre; patching this flag afterwards
+# has no effect. Tests patch ``torch._inductor.config.freezing`` directly.
 #
 # Off by default because it changes what reaches every Spyre pass: folding runs
 # upstream of ``post_grad_custom_pre_pass``, so a pass that expected to see a

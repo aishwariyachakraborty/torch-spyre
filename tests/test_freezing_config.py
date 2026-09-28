@@ -12,72 +12,47 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Device-free tests for the opt-in Inductor freezing flag (SPYRE_FREEZING).
+"""Device-free tests for the opt-in SPYRE_FREEZING flag.
 
-These assert the *plumbing* only: that ``spyre_freezing`` reaches
-``torch._inductor.config.freezing`` through ``enable_spyre_context``, that it is
-off by default, and that the surrounding config is untouched either way. Whether
-folding then actually fires, and what it does to the graph, needs a real compile
--- see ``test_freezing_graph.py``, which is skipped without a backend compiler.
+The flag is read once, when the compile_fx wrapper is installed, and sets
+``torch._inductor.config.freezing`` process-wide so Dynamo sees it at trace
+time. Each case therefore runs in a fresh interpreter.
 """
 
+import os
+import subprocess
+import sys
+
+_PROBE = """
 import torch
-
-from torch_spyre._inductor import config as spyre_config
-from torch_spyre._inductor.patches import enable_spyre_context
-
-
-def test_freezing_is_off_by_default():
-    """The flag defaults off, so an unconfigured environment is unchanged."""
-    assert spyre_config.spyre_freezing is False
+import torch_spyre
+from torch_spyre._inductor import enable_spyre_compile_fx_wrapper
+enable_spyre_compile_fx_wrapper()
+c = torch._inductor.config
+print(c.freezing, c.freezing_discard_parameters)
+"""
 
 
-def test_freezing_not_set_when_flag_off():
-    """With the flag off, Spyre must not pin ``freezing`` at all.
-
-    The assertion is that Spyre leaves Inductor's own default in place rather
-    than writing False over it -- that is why patches.py spreads the key in
-    conditionally instead of setting it to a boolean.
-    """
-    outer = torch._inductor.config.freezing
-    with spyre_config.patch(spyre_freezing=False):
-        with enable_spyre_context([]):
-            assert torch._inductor.config.freezing == outer
-
-
-def test_freezing_set_when_flag_on():
-    """With the flag on, ``config.freezing`` is True inside the CM."""
-    with spyre_config.patch(spyre_freezing=True):
-        with enable_spyre_context([]):
-            assert torch._inductor.config.freezing is True
+def _probe(env_value):
+    env = dict(os.environ)
+    env.pop("SPYRE_FREEZING", None)
+    if env_value is not None:
+        env["SPYRE_FREEZING"] = env_value
+    out = subprocess.run(
+        [sys.executable, "-c", _PROBE], env=env, capture_output=True, text=True, check=True
+    )
+    freezing, discard = out.stdout.strip().splitlines()[-1].split()
+    return freezing == "True", discard == "True"
 
 
-def test_freezing_is_restored_on_exit():
-    """``config.patch`` must restore the previous value when the CM exits."""
-    before = torch._inductor.config.freezing
-    with spyre_config.patch(spyre_freezing=True):
-        with enable_spyre_context([]):
-            pass
-    assert torch._inductor.config.freezing == before
+def test_freezing_off_when_unset():
+    assert _probe(None) == (False, False)
 
 
-def test_parameters_are_not_discarded():
-    """``freezing_discard_parameters`` stays off even with freezing enabled.
-
-    Discarding parameters would leave the compiled module unable to reload its
-    original state_dict. Enabling freezing must not opt into that silently.
-    """
-    with spyre_config.patch(spyre_freezing=True):
-        with enable_spyre_context([]):
-            assert torch._inductor.config.freezing_discard_parameters is False
+def test_freezing_off_when_zero():
+    assert _probe("0") == (False, False)
 
 
-def test_other_spyre_config_unchanged_by_freezing():
-    """Enabling freezing must not perturb the rest of ``new_config``."""
-    with spyre_config.patch(spyre_freezing=True):
-        with enable_spyre_context([]):
-            assert torch._inductor.config.split_reductions is False
-            assert torch._inductor.config.permute_fusion is False
-            assert torch._inductor.config.allow_buffer_reuse is False
-            assert torch._inductor.config.fallback_random is True
-            assert torch._inductor.config.unroll_reductions_threshold == 1
+def test_freezing_on_when_set():
+    """On, and parameters are not discarded (state_dict stays reloadable)."""
+    assert _probe("1") == (True, False)

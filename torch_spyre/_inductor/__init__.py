@@ -86,6 +86,17 @@ def enable_spyre_compile_fx_wrapper():
 
         patch_inductor_fusions()
 
+        # Freezing has to be on before Dynamo traces, not just inside
+        # compile_fx: Dynamo reads torch._inductor.config.freezing at trace time
+        # to decide whether module parameters become real parameters (filling
+        # TracingContext.params_flat) or plain graph inputs. Set late, in
+        # enable_spyre_context's new_config, freeze() sees params_flat == 0 and
+        # keeps every weight as a runtime input, freezing nothing. The cost is
+        # that this is process-wide: with SPYRE_FREEZING=1 non-Spyre compiles
+        # freeze too, which is why the flag is opt-in.
+        if config.spyre_freezing:
+            torch._inductor.config.freezing = True
+
         _orig = cfx.compile_fx
         from torch_spyre._inductor.logging_utils import get_inductor_logger
 
