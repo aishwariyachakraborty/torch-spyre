@@ -12,41 +12,46 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""What freezing actually does to the graph Spyre's passes receive.
+"""What SPYRE_FREEZING actually does to the graph Spyre's passes receive.
 
-The config test asserts the flag is wired. This asserts the consequence, which
-is the part that decides whether freezing is useful on Spyre:
+Runs on the Spyre device, because it has to: the compile_fx wrapper only enters
+``enable_spyre_context`` -- where ``new_config`` and therefore ``freezing`` are
+applied -- when ``_uses_spyre(gm, example_inputs)`` is true
+(torch_spyre/_inductor/__init__.py). On CPU tensors the flag is inert.
 
-  1. Parameters arrive at the post-grad passes as ``get_attr`` constants rather
-     than placeholders -- the precondition for every folding rewrite.
-  2. Three ``nn.Linear`` layers sharing one activation are concatenated into one
-     wider GEMM (concat-linear), and the weight count drops.
-  3. The resulting op mix is one Spyre can lower. This is the known-risk test:
-     concat-linear emits ``addmm``, for which ``lowering.py`` registers no
-     lowering, so ``decompose_addmm`` must split it back into ``mm + add``.
-
-Each test captures the graph via a post-grad hook rather than compiling all the
-way down, so (1) and (2) need no device. Test (3) is the same hook, asserting on
-the op set the Spyre lowerings will be asked for.
+The graph is captured by wrapping ``CustomPostPasses.__call__`` rather than by
+patching ``post_grad_custom_post_pass``, since ``new_config`` installs its own
+CustomPostPasses inside any outer patch. Ops are recorded both on entry (after
+upstream freezing, before any Spyre post-grad pass) and on exit (after
+decompose_addmm / mm_to_bmm / bmm_unflatten).
 
 Run:
-    pytest tests/test_freezing_graph.py -v
-    SPYRE_FREEZING=1 pytest tests/test_freezing_graph.py -v   # same result; the
-        tests set the flag themselves, so the env var is not required.
+    pytest tests/test_freezing_graph.py -v -s
 """
 
+import pytest
 import torch
 import torch.nn as nn
 
 from torch_spyre._inductor import config as spyre_config
+from torch_spyre._inductor.passes import CustomPostPasses
+
+DEVICE = "spyre"
+DTYPE = torch.float16
+
+
+def _spyre_available() -> bool:
+    try:
+        return bool(torch.spyre.is_available())
+    except Exception:
+        return False
+
+
+pytestmark = pytest.mark.skipif(not _spyre_available(), reason="needs a Spyre device")
 
 
 class _ThreeParallelLinears(nn.Module):
-    """Three Linears over one shared activation -- the concat-linear shape.
-
-    This is the q/k/v projection shape: the pattern freezing's concat-linear is
-    built to find, and the reason #32 was ranked worth doing.
-    """
+    """Three Linears over one shared activation -- the q/k/v concat-linear shape."""
 
     def __init__(self, in_features: int = 64, out_features: int = 64) -> None:
         super().__init__()
@@ -58,137 +63,107 @@ class _ThreeParallelLinears(nn.Module):
         return self.q(x) + self.k(x) + self.v(x)
 
 
-def _capture_post_grad_graph(mod, example, *, freezing: bool):
-    """Compile ``mod`` and return the post-grad FX graph Spyre's passes see.
+def _make():
+    torch.manual_seed(0)
+    mod = _ThreeParallelLinears().to(DEVICE, DTYPE).eval()
+    example = torch.randn(8, 64, dtype=DTYPE).to(DEVICE)
+    return mod, example
 
-    Hooks ``post_grad_custom_post_pass``, which is where Spyre installs
-    CustomPostPasses -- so what this captures is exactly what Spyre receives,
-    after upstream freezing has had its turn.
+
+def _summarize(graph):
+    return {
+        "ops": [str(n.target) for n in graph.nodes if n.op == "call_function"],
+        "get_attr": sum(1 for n in graph.nodes if n.op == "get_attr"),
+        "placeholders": sum(1 for n in graph.nodes if n.op == "placeholder"),
+    }
+
+
+def _compile_and_capture(monkeypatch, mod, example, *, freezing: bool):
+    """Compile fresh and return (output, before, after) for the first forward graph.
+
+    ``before`` is the graph as CustomPostPasses receives it; ``after`` is what it
+    hands on to lowering. The graph is mutated in place, so each is summarized
+    at the moment it is taken rather than kept as a graph object.
     """
     captured = {}
+    orig_call = CustomPostPasses.__call__
 
-    def _capture(graph):
-        # Record the first (forward) graph only; a backward graph would overwrite
-        # the thing under test.
-        captured.setdefault("graph", graph)
-        return graph
+    def _recording_call(self, graph):
+        first = "before" not in captured
+        if first:
+            captured["before"] = _summarize(graph)
+        result = orig_call(self, graph)
+        if first:
+            captured["after"] = _summarize(graph)
+        return result
 
+    monkeypatch.setattr(CustomPostPasses, "__call__", _recording_call)
+
+    # Without these, a second compile of the same forward reuses Dynamo's cached
+    # frame (or an FX/AOT cache entry) and post-grad never runs again.
+    torch._dynamo.reset()
     with spyre_config.patch(spyre_freezing=freezing):
-        with torch._inductor.config.patch(post_grad_custom_post_pass=_capture):
+        with torch._inductor.config.patch(force_disable_caches=True):
             compiled = torch.compile(mod, backend="inductor")
             with torch.no_grad():
-                compiled(example)
+                out = compiled(example)
 
-    assert "graph" in captured, (
-        "post_grad_custom_post_pass never fired -- the compile did not reach "
-        "post-grad, so nothing was captured. Check that torch.compile actually "
-        "compiled (not eager-fallback) before reading into this failure."
+    monkeypatch.setattr(CustomPostPasses, "__call__", orig_call)
+    assert "before" in captured, (
+        "CustomPostPasses never ran -- the compile did not take the Spyre path "
+        "(check _uses_spyre) or did not reach post-grad."
     )
-    return captured["graph"]
+    print(f"\n[freezing={freezing}] before: {captured['before']}")
+    print(f"[freezing={freezing}] after : {captured['after']}")
+    return out, captured["before"], captured["after"]
 
 
-def _op_names(graph) -> list[str]:
-    return [str(n.target) for n in graph.nodes if n.op == "call_function"]
+def _gemms(summary) -> int:
+    return sum(1 for op in summary["ops"] if "mm" in op)
 
 
-def _count(graph, op_substring: str) -> int:
-    return sum(1 for name in _op_names(graph) if op_substring in name)
+def test_parameters_become_constants_under_freezing(monkeypatch):
+    """Frozen parameters arrive as get_attr constants, not placeholders."""
+    mod, example = _make()
+    _, frozen, _ = _compile_and_capture(monkeypatch, mod, example, freezing=True)
+    _, thawed, _ = _compile_and_capture(monkeypatch, mod, example, freezing=False)
+
+    assert frozen["get_attr"] > thawed["get_attr"], (frozen, thawed)
+    assert frozen["placeholders"] < thawed["placeholders"], (frozen, thawed)
 
 
-def test_parameters_become_constants_under_freezing():
-    """Freezing must turn parameters into get_attr constants.
+def test_concat_linear_merges_parallel_linears(monkeypatch):
+    """Three parallel Linears collapse into fewer GEMMs before Spyre's passes run.
 
-    This is the precondition for all folding: with parameters still arriving as
-    placeholders there is nothing for a folding pass to fold.
+    On a Spyre tensor check_concat_weights' CPU gate
+    (``is_cpu and not config.cpp.enable_concat_linear``) short-circuits, so no
+    cpp flag is needed.
     """
-    mod = _ThreeParallelLinears().eval()
-    example = torch.randn(8, 64)
+    mod, example = _make()
+    _, frozen, _ = _compile_and_capture(monkeypatch, mod, example, freezing=True)
+    _, thawed, _ = _compile_and_capture(monkeypatch, mod, example, freezing=False)
 
-    frozen = _capture_post_grad_graph(mod, example, freezing=True)
-    thawed = _capture_post_grad_graph(mod, example, freezing=False)
-
-    frozen_attrs = sum(1 for n in frozen.nodes if n.op == "get_attr")
-    thawed_attrs = sum(1 for n in thawed.nodes if n.op == "get_attr")
-
-    assert frozen_attrs > thawed_attrs, (
-        f"freezing produced no new get_attr constants "
-        f"(frozen={frozen_attrs}, thawed={thawed_attrs}). Either freezing did "
-        f"not run, or it ran and folded nothing."
-    )
+    assert _gemms(frozen) < _gemms(thawed), (frozen["ops"], thawed["ops"])
 
 
-def test_concat_linear_merges_parallel_linears():
-    """Three parallel Linears should collapse into fewer, wider GEMMs.
+def test_no_addmm_reaches_lowering(monkeypatch):
+    """No addmm may leave CustomPostPasses: lowering.py has no addmm rule.
 
-    NOTE on the gate, because it is easy to misread. check_concat_weights
-    (torch/_inductor/fx_passes/freezing_patterns.py:127-129) reads
-    ``match.kwargs["inp"].meta["val"].is_cpu`` -- the device of the MATCHED
-    activation -- and only then requires ``config.cpp.enable_concat_linear``:
-
-        is_cpu = match.kwargs["inp"].meta["val"].is_cpu
-        if is_cpu and not config.cpp.enable_concat_linear:
-            return False
-
-    So on a CPU tensor this is off by default, and on a Spyre tensor the gate
-    short-circuits and concat-linear runs. This test therefore runs on CPU and
-    MUST enable the cpp flag to see the rewrite at all -- which is what makes it
-    a test of the rewrite rather than of the gate. On device the flag is moot.
+    decompose_addmm runs first in CustomPostPasses. If this fails, concat-linear
+    produced an addmm form decompose_addmm does not recognize, and that is the
+    Part 2 fix.
     """
-    mod = _ThreeParallelLinears().eval()
-    example = torch.randn(8, 64)
+    mod, example = _make()
+    _, _, after = _compile_and_capture(monkeypatch, mod, example, freezing=True)
 
-    # Required only because this test runs on CPU; see the docstring.
-    with torch._inductor.config.patch({"cpp.enable_concat_linear": True}):
-        frozen = _capture_post_grad_graph(mod, example, freezing=True)
-        thawed = _capture_post_grad_graph(mod, example, freezing=False)
-
-    def gemms(graph):
-        return _count(graph, "mm") + _count(graph, "addmm")
-
-    assert gemms(frozen) < gemms(thawed), (
-        f"no GEMM merging under freezing (frozen={gemms(frozen)}, "
-        f"thawed={gemms(thawed)}). Op names frozen: {_op_names(frozen)}"
-    )
+    leftover = [op for op in after["ops"] if "addmm" in op]
+    assert not leftover, after["ops"]
 
 
-def test_no_addmm_survives_for_spyre_to_lower():
-    """The known risk: concat-linear emits addmm, which Spyre cannot lower.
+def test_numerics_frozen_matches_unfrozen(monkeypatch):
+    """Freezing must not change results on device."""
+    mod, example = _make()
+    frozen_out, _, _ = _compile_and_capture(monkeypatch, mod, example, freezing=True)
+    thawed_out, _, _ = _compile_and_capture(monkeypatch, mod, example, freezing=False)
 
-    ``lowering.py`` registers ``aten.mm.default`` and ``aten.bmm.default`` but
-    not ``aten.addmm``; ``decompose_addmm`` in CustomPostPasses is what splits
-    addmm into mm + add. This asserts that by the time the graph is handed on,
-    no bare addmm is left.
-
-    A failure here is the expected first failure of this work, and it is
-    informative rather than fatal: it means concat-linear fires (good) but its
-    output reaches lowering in a form Spyre has no rule for, and the fix is
-    pass ordering -- decompose_addmm must run after folding, not before.
-    """
-    mod = _ThreeParallelLinears().eval()
-    example = torch.randn(8, 64)
-
-    with torch._inductor.config.patch({"cpp.enable_concat_linear": True}):
-        frozen = _capture_post_grad_graph(mod, example, freezing=True)
-    leftover = [n for n in _op_names(frozen) if "addmm" in n]
-
-    assert not leftover, (
-        f"addmm survived to the Spyre passes: {leftover}. lowering.py has no "
-        f"addmm rule, so this must be decomposed first. See the docstring -- "
-        f"this is a pass-ordering fix, not a premise failure."
-    )
-
-
-def test_numerics_match_eager_under_freezing():
-    """Folding must not change results. Runs on CPU; no device needed."""
-    mod = _ThreeParallelLinears().eval()
-    example = torch.randn(8, 64)
-
-    with torch.no_grad():
-        expected = mod(example)
-
-    with spyre_config.patch(spyre_freezing=True):
-        compiled = torch.compile(mod, backend="inductor")
-        with torch.no_grad():
-            actual = compiled(example)
-
-    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(frozen_out.cpu(), thawed_out.cpu(), rtol=1e-2, atol=1e-2)
