@@ -27,6 +27,10 @@ CustomPostPasses inside any outer patch. Ops are recorded both on entry (after
 upstream freezing, before any Spyre post-grad pass) and on exit (after
 decompose_addmm / mm_to_bmm / bmm_unflatten).
 
+Frozen Spyre constants reach CustomPostPasses as trailing ``spyre_frozen_*``
+placeholders, not ``get_attr`` nodes: _spyre_inner_compile lifts them back to
+inputs so Spyre's layout and planning passes handle them like any other input.
+
 Run:
     pytest tests/test_freezing_graph.py -v -s
 """
@@ -77,6 +81,11 @@ def _summarize(graph):
         "ops": [str(n.target) for n in graph.nodes if n.op == "call_function"],
         "get_attr": sum(1 for n in graph.nodes if n.op == "get_attr"),
         "placeholders": sum(1 for n in graph.nodes if n.op == "placeholder"),
+        "frozen": sum(
+            1
+            for n in graph.nodes
+            if n.op == "placeholder" and str(n.target).startswith("spyre_frozen_")
+        ),
     }
 
 
@@ -124,13 +133,22 @@ def _gemms(summary) -> int:
 
 
 def test_parameters_become_constants_under_freezing(monkeypatch):
-    """Frozen parameters arrive as get_attr constants, not placeholders."""
+    """Freezing folds the parameters, and the results arrive as lifted inputs.
+
+    Unfrozen: 6 parameter placeholders + 1 activation, each weight transposed at
+    runtime. Frozen: the transposes are folded away, and what remains of the
+    weights arrives as ``spyre_frozen_*`` placeholders.
+    """
     mod, example = _make()
     _, frozen, _ = _compile_and_capture(monkeypatch, mod, example, freezing=True)
     _, thawed, _ = _compile_and_capture(monkeypatch, mod, example, freezing=False)
 
-    assert frozen["get_attr"] > thawed["get_attr"], (frozen, thawed)
-    assert frozen["placeholders"] < thawed["placeholders"], (frozen, thawed)
+    def permutes(summary):
+        return sum(1 for op in summary["ops"] if "permute" in op)
+
+    assert frozen["frozen"] > 0, frozen
+    assert thawed["frozen"] == 0, thawed
+    assert permutes(frozen) < permutes(thawed), (frozen["ops"], thawed["ops"])
 
 
 def test_concat_linear_merges_parallel_linears(monkeypatch):

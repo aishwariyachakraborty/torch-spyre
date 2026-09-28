@@ -18,6 +18,8 @@ from . import config
 
 import threading
 from functools import wraps
+
+import torch
 from typing import Any
 
 from .propagate_hints import spyre_hint, get_op_hints  # noqa: F401
@@ -70,7 +72,77 @@ def _spyre_inner_compile(*args: Any, **kwargs: Any) -> Any:
     from torch_spyre._inductor.decompositions import get_spyre_decomp_table
 
     kwargs["get_decomp_fn"] = get_spyre_decomp_table
-    return compile_fx_inner(*args, **kwargs)
+    return _lift_spyre_constants_and_compile(compile_fx_inner, *args, **kwargs)
+
+
+def _lift_spyre_constants_and_compile(compile_fn, gm, example_inputs, **kwargs):
+    """Turn frozen Spyre-tensor constants back into graph inputs, then compile.
+
+    Freezing (SPYRE_FREEZING=1) folds parameters into ``get_attr`` constants
+    before ``inner_compile`` -- which is what licenses constant folding and
+    concat-linear. But every Spyre pass that assigns or plans device layouts
+    (propagate_layouts, optimize_restickify, hbm_pool_planning, the LX planner,
+    ...) enumerates graph inputs and op outputs, and none knows about Inductor
+    constants. So keep freezing's rewrites, and hand the folded results to the
+    rest of the pipeline as ordinary inputs: each Spyre-resident ``get_attr``
+    becomes a trailing placeholder, and the compiled callable appends the
+    constant tensors to its arguments at call time.
+
+    Real inputs are extended in the same order: propagate_layouts pairs
+    ``graph_input_names`` with ``V.get_real_inputs()`` positionally to read each
+    input's device layout. With no Spyre constants (freezing off) this is a
+    no-op passthrough.
+    """
+    lifted = [
+        n
+        for n in gm.graph.nodes
+        if n.op == "get_attr"
+        and isinstance(getattr(gm, n.target, None), torch.Tensor)
+        and getattr(gm, n.target).device.type == DEVICE_NAME
+    ]
+    if not lifted:
+        return compile_fn(gm, example_inputs, **kwargs)
+
+    from torch._guards import detect_fake_mode
+    from torch._inductor.virtualized import V
+
+    consts = [getattr(gm, n.target) for n in lifted]
+    placeholders = [n for n in gm.graph.nodes if n.op == "placeholder"]
+    anchor = placeholders[-1] if placeholders else next(iter(gm.graph.nodes))
+    for node in lifted:
+        with (
+            gm.graph.inserting_after(anchor)
+            if placeholders
+            else gm.graph.inserting_before(anchor)
+        ):
+            ph = gm.graph.placeholder(f"spyre_frozen_{node.target}")
+        ph.meta.update(node.meta)
+        node.replace_all_uses_with(ph)
+        gm.graph.erase_node(node)
+        anchor, placeholders = ph, [ph]
+    gm.recompile()
+
+    fake_mode = detect_fake_mode(example_inputs)
+    fake_consts = [fake_mode.from_tensor(c) if fake_mode else c for c in consts]
+    n_orig = len(example_inputs)
+    new_inputs = list(example_inputs) + fake_consts
+    # Constants never change between calls; let Inductor treat them as static.
+    kwargs["static_input_idxs"] = list(kwargs.get("static_input_idxs") or []) + list(
+        range(n_orig, n_orig + len(consts))
+    )
+
+    real = V.get_real_inputs()
+    real_inputs = list(real[:n_orig]) if real else []
+    with V.set_real_inputs(real_inputs + consts):
+        compiled = compile_fn(gm, new_inputs, **kwargs)
+
+    def _call_with_constants(args):
+        args = list(args)
+        args.extend(consts)
+        return compiled(args)
+
+    _call_with_constants._boxed_call = True  # type: ignore[attr-defined]
+    return _call_with_constants
 
 
 def enable_spyre_compile_fx_wrapper():

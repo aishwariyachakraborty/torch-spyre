@@ -19,7 +19,6 @@ import torch
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     ComputedBuffer,
-    ConstantBuffer,
     FixedLayout,
     MutationLayoutSHOULDREMOVE,
     TensorBox,
@@ -98,63 +97,6 @@ def _preserve_spyre_input_storage_offsets():
         yield
     finally:
         GraphLowering.placeholder = old_placeholder  # type: ignore[method-assign]
-
-
-@contextmanager
-def _spyre_tiled_constant_buffers():
-    """Give Spyre-resident graph constants a FixedTiledLayout.
-
-    Upstream ``GraphLowering.try_get_buffer`` builds a fresh ``ConstantBuffer``
-    with a plain ``FixedLayout`` on every lookup of a name in
-    ``V.graph.constants``. Spyre's layout propagation requires every read buffer
-    to carry a device layout (``_get_prop_args`` raises "does not have
-    FixedTiledLayout"), and before freezing no Spyre graph had tensor constants
-    to trip it. Frozen parameters -- and concat-linear's concatenated weights --
-    are real Spyre tensors, so their device layout is known: take it from
-    ``device_tensor_layout()``, as layout propagation does for graph inputs.
-
-    One buffer is cached per constant name so a layout later passes attach to it
-    persists across lookups, instead of being dropped with the next fresh copy.
-    Constants with no Spyre layout (host scalars) fall through to upstream.
-    """
-    from .ir import FixedTiledLayout
-
-    old_try_get_buffer = GraphLowering.try_get_buffer
-
-    def _spyre_try_get_buffer(self: GraphLowering, buffer_name: str):
-        if (
-            buffer_name in self.name_to_buffer
-            or buffer_name in self.graph_inputs
-            or buffer_name not in self.constants
-        ):
-            return old_try_get_buffer(self, buffer_name)
-
-        cache = self.__dict__.setdefault("_spyre_constant_buffers", {})
-        if buffer_name in cache:
-            return cache[buffer_name]
-
-        data = self.constants[buffer_name]
-        stl = (
-            data.device_tensor_layout()
-            if isinstance(data, torch.Tensor) and data.device.type == DEVICE_NAME
-            else None
-        )
-        if stl is None:
-            return old_try_get_buffer(self, buffer_name)
-
-        size, stride = self.static_sizes_strides(data)
-        buf = ConstantBuffer(
-            name=buffer_name,
-            layout=FixedTiledLayout(data.device, data.dtype, size, stride, stl),
-        )
-        cache[buffer_name] = buf
-        return buf
-
-    GraphLowering.try_get_buffer = _spyre_try_get_buffer  # type: ignore[method-assign]
-    try:
-        yield
-    finally:
-        GraphLowering.try_get_buffer = old_try_get_buffer  # type: ignore[method-assign]
 
 
 @contextmanager
@@ -285,7 +227,6 @@ def enable_spyre_context(example_inputs: list[InputType]):
     with (
         spyre_data_types(),
         _preserve_spyre_input_storage_offsets(),
-        _spyre_tiled_constant_buffers(),
         enable_spyre_lowerings(),
         V.set_real_inputs(example_inputs),
         V.set_choices_handler(SpyreHeuristics()),

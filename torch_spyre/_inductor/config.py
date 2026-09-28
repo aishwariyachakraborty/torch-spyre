@@ -96,8 +96,9 @@ disable_conv2d_spatial_split: bool = (
 # there. Freezing makes ``fw_compiler_freezing`` treat parameters as constants
 # before ``inner_compile`` runs, licensing constant folding of parameter-only
 # subgraphs and concat-linear (several ``mm``/``addmm`` sharing one activation
-# become one wider GEMM against a concatenated constant weight). Frozen Spyre
-# constants get a FixedTiledLayout from _spyre_tiled_constant_buffers.
+# become one wider GEMM against a concatenated constant weight). The folded Spyre
+# constants are then lifted back to graph inputs by _spyre_inner_compile, so the
+# Spyre layout and planning passes see them as ordinary inputs.
 #
 # Set the env var before importing torch_spyre; patching this flag afterwards
 # has no effect. Tests patch ``torch._inductor.config.freezing`` directly.
