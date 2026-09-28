@@ -27,6 +27,7 @@ from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.utils import InputType
 from torch._inductor.virtualized import V
 
+from . import config as spyre_config
 from .constants import DEVICE_NAME
 
 
@@ -158,6 +159,12 @@ def enable_spyre_context(example_inputs: list[InputType]):
         # Spyre has no device-side RNG: replace_random would rewrite aten RNG ops
         # into prims.inductor_random, whose index_expr lowering Spyre cannot codegen.
         "fallback_random": True,
+        # Opt-in (SPYRE_FREEZING=1), off by default -- see spyre_freezing in
+        # config.py for what it changes and why it is staged. Spread rather than
+        # set to False so that with the flag off this dict is byte-for-byte what
+        # it was before freezing existed, leaving Inductor's own default in place
+        # instead of pinning it here.
+        **({"freezing": True} if spyre_config.spyre_freezing else {}),
     }
 
     from torch._inductor.ir import Loops

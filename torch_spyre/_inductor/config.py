@@ -90,6 +90,26 @@ disable_conv2d_spatial_split: bool = (
     os.environ.get("SPYRE_INDUCTOR_DISABLE_CONV2D_SPATIAL_SPLIT", "1") == "1"
 )
 
+# Opt-in Inductor freezing. Sets ``config.freezing`` for the compile, which makes
+# ``fw_compiler_freezing`` treat parameters as constants before ``inner_compile``
+# runs -- licensing constant folding of parameter-only subgraphs and concat-linear
+# (several ``mm``/``addmm`` sharing one activation become one wider GEMM against a
+# concatenated constant weight).
+#
+# Off by default because it changes what reaches every Spyre pass: folding runs
+# upstream of ``post_grad_custom_pre_pass``, so a pass that expected to see a
+# parameter now sees a ``get_attr`` constant. Two things worth knowing before
+# enabling it:
+#
+#   * ``freezing_discard_parameters`` is deliberately left False. Discarding
+#     parameters makes the compiled module unable to reload its original
+#     state_dict, which is not a tradeoff this flag should make silently.
+#   * concat-linear folds into ``addmm``, which has no Spyre lowering
+#     (``lowering.py`` registers ``aten.mm``/``aten.bmm``, not ``aten.addmm``);
+#     ``decompose_addmm`` in CustomPostPasses splits it back. That path is why
+#     this is staged rather than on.
+spyre_freezing: bool = os.environ.get("SPYRE_FREEZING", "0") == "1"
+
 # Opt-in OpSpec->KTIR emitter (experimental, #3380). When enabled the scheduler
 # emits ``async_compile.ktir(...)`` instead of the SDSC bundle, and
 # ``create_tensor_arg`` populates the op-spec buffer name so the emitter has a
