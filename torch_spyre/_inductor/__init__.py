@@ -123,7 +123,12 @@ def _lift_spyre_constants_and_compile(compile_fn, gm, example_inputs, **kwargs):
     gm.recompile()
 
     fake_mode = detect_fake_mode(example_inputs)
-    fake_consts = [fake_mode.from_tensor(c) if fake_mode else c for c in consts]
+    # static_shapes: a constant's shape is fixed by definition. Left to the fake
+    # mode's shape env, from_tensor may allocate symbolic sizes, and the symbols
+    # then surface as non-integer loop ranges in the LX scratchpad planner.
+    fake_consts = [
+        fake_mode.from_tensor(c, static_shapes=True) if fake_mode else c for c in consts
+    ]
     n_orig = len(example_inputs)
     new_inputs = list(example_inputs) + fake_consts
     # Constants never change between calls; let Inductor treat them as static.
