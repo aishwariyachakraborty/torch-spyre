@@ -90,7 +90,7 @@ def _summarize(graph):
 
 
 def _compile_and_capture(monkeypatch, mod, example, *, freezing: bool):
-    """Compile fresh and return (output, before, after) for the first forward graph.
+    """Compile fresh and return (output, before, after) for the model's forward graph.
 
     ``before`` is the graph as CustomPostPasses receives it; ``after`` is what it
     hands on to lowering. The graph is mutated in place, so each is summarized
@@ -99,13 +99,14 @@ def _compile_and_capture(monkeypatch, mod, example, *, freezing: bool):
     captured = {}
     orig_call = CustomPostPasses.__call__
 
+    # Keep the LAST graph, not the first. Under freezing, concat-linear's weight
+    # concatenation runs eagerly on Spyre during freeze(), and that eager op is
+    # itself compiled -- a small nested graph (a lone aten.cat) that reaches
+    # CustomPostPasses before the model's own graph does.
     def _recording_call(self, graph):
-        first = "before" not in captured
-        if first:
-            captured["before"] = _summarize(graph)
+        before = _summarize(graph)
         result = orig_call(self, graph)
-        if first:
-            captured["after"] = _summarize(graph)
+        captured["before"], captured["after"] = before, _summarize(graph)
         return result
 
     monkeypatch.setattr(CustomPostPasses, "__call__", _recording_call)
