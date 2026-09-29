@@ -169,6 +169,13 @@ def _assert_handles_survive_real_compile(monkeypatch, model, expect_rewrite):
     #     fused_from. Each linear lowers to permute + mm fused into one buffer,
     #     so its handle carries a multi-entry fused_from, at least one entry of
     #     which resolves back to the model source line.
+    #
+    #     Under freezing (SPYRE_FREEZING=1) the weight transpose is constant-
+    #     folded at compile time, so each linear lowers to a bare mm with a
+    #     single source and there is no permute + mm fusion to observe. (c)
+    #     above still holds there; only this fusion-shaped check is moot.
+    if torch._inductor.config.freezing:
+        return
     fused = [h for h in collected if h is not None and len(h.fused_from) >= 2]
     assert fused, "no fused handle with a multi-source fused_from was produced"
     assert any(
