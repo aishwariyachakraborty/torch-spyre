@@ -20,7 +20,6 @@
 #include <cstring>
 #include <memory>
 #include <nlohmann/json.hpp>
-#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <type_traits>
@@ -595,6 +594,7 @@ inline std::string memoryCopyOperationName(uint8_t kind) {
   }
   return "<unknown>";
 }
+
 inline uint32_t getBaseResourceId(const AIUpti_ActivityMemcpy* activity) {
   return activity->copy_kind * 100;
 }
@@ -886,10 +886,10 @@ void AiuptiActivityProfilerSession::handlePtiActivity(
           reinterpret_cast<const AIUpti_ActivityMemory*>(record), logger);
       break;
     default:
-      errors_.push_back("Unexpected activity type: " + std::to_string(record->kind));
+      errors_.push_back("Unexpected activity type: " +
+                        std::to_string(record->kind));
       break;
   }
 }
 
 }  // namespace KINETO_NAMESPACE
-
