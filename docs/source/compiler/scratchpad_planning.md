@@ -143,12 +143,13 @@ _maybe_coarse_tile_hints              # hint-driven coarse tiling, when hints pr
 insert_bmm_padding                    # pad matmul y's K (pre-stickification)
 split_multi_ops
 propagate_spyre_tensor_layouts        # assign FixedTiledLayout
-reorder_nonstick_dims                 # reorder matmul non-stick dims for work division
 validate_ops
 optimize_restickify_locations
+reorder_nonstick_dims                 # reorder matmul non-stick dims for work division
 finalize_layouts
 insert_restickify
 enforce_indirect_access_layout
+reorder_nonstick_dims_mutation        # execute deferred reorders after insert_restickify
 insert_post_mutation_restickify
 insert_restickify_padding
 dedup_and_promote_constants
