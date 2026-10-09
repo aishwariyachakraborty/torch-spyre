@@ -328,18 +328,6 @@ inline std::string runtimeCbidName(AIUpti_runtime_api_trace_cbid cbid) {
       return "aiuCommsHdmaFirmwareReset";
     case AIUPTI_RUNTIME_TRACE_CBID_WAIT_FOR_QUEUE_CAPACITY:
       return "aiuWaitForQueueCapacity";
-    case AIUPTI_RUNTIME_TRACE_CBID_CMPT_EXEC:
-      return "aiuCmptExec";
-    case AIUPTI_RUNTIME_TRACE_CBID_DMAI_EXEC:
-      return "aiuDmaIExec";
-    case AIUPTI_RUNTIME_TRACE_CBID_DMAO_EXEC:
-      return "aiuDmaOExec";
-    case AIUPTI_RUNTIME_TRACE_CBID_CMPT_EXEC_BEGIN:
-      return "aiuCmptExecBegin";
-    case AIUPTI_RUNTIME_TRACE_CBID_DMAI_EXEC_BEGIN:
-      return "aiuDmaIExecBegin";
-    case AIUPTI_RUNTIME_TRACE_CBID_DMAO_EXEC_BEGIN:
-      return "aiuDmaOExecBegin";
     default:
       break;
   }
