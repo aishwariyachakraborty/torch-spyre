@@ -459,6 +459,11 @@ inline uint32_t getBaseResourceId(const AIUpti_ActivityMemcpy* activity) {
   return activity->copy_kind * 100;
 }
 
+inline uint32_t getBaseResourceId(const AIUpti_ActivityMemcpyPtoP* activity) {
+  // PTOP lands on 300, between DtoH and memory
+  return activity->copy_kind * 100;
+}
+
 inline uint32_t getBaseResourceId(const AIUpti_ActivityMemory* activity) {
   return 400;
 }
@@ -499,6 +504,8 @@ uint32_t AiuptiActivityProfilerSession::getResourceId(
 
 template uint32_t AiuptiActivityProfilerSession::getResourceId<
     AIUpti_ActivityMemcpy>(AIUpti_ActivityMemcpy* activity);
+template uint32_t AiuptiActivityProfilerSession::getResourceId<
+    AIUpti_ActivityMemcpyPtoP>(AIUpti_ActivityMemcpyPtoP* activity);
 template uint32_t AiuptiActivityProfilerSession::getResourceId<
     AIUpti_ActivityMemory>(AIUpti_ActivityMemory* activity);
 template uint32_t AiuptiActivityProfilerSession::getResourceId<
@@ -560,6 +567,60 @@ void AiuptiActivityProfilerSession::handleMemcpyActivity(
   //   traceBuffer_.activities.pop_back();
   //   return;
   // }
+  memcpy_activity->log(*logger);
+}
+
+// flex reports src/dst of a P2P RDMA copy as ranks (BAT indices), and uses
+// UINT32_MAX as the destination of a multicast, whose peer set is not carried
+// on the data control block.
+inline std::string p2pRankName(uint32_t rank) {
+  return rank == UINT32_MAX ? "multicast" : std::to_string(rank);
+}
+
+void AiuptiActivityProfilerSession::handleMemcpyPtoPActivity(
+    const AIUpti_ActivityMemcpyPtoP* activity,
+    libkineto::ActivityLogger* logger) {
+  traceBuffer_.span.opCount += 1;
+  traceBuffer_.gpuOpCount += 1;
+  cpuCorrelationMap_[activity->correlation_id] = 0;  // fake add correlation
+  const libkineto::ITraceActivity* linked =
+      linkedActivity(activity->correlation_id, cpuCorrelationMap_);
+  traceBuffer_.emplace_activity(
+      traceBuffer_.span, libkineto::ActivityType::GPU_MEMCPY,
+      fmt::format("Memcpy ({})", memoryCopyOperationName(activity->copy_kind)));
+  auto& memcpy_activity = traceBuffer_.activities.back();
+  memcpy_activity->startTime = activity->start;
+  memcpy_activity->endTime = activity->end;
+  memcpy_activity->id = activity->correlation_id;
+  memcpy_activity->device = activity->device_id;
+  memcpy_activity->resource = getResourceId(activity);
+  memcpy_activity->threadId = activity->stream_id;
+  memcpy_activity->flow.id = 0;
+  memcpy_activity->flow.type = libkineto::kLinkAsyncCpuGpu;
+  memcpy_activity->flow.start = 0;
+  memcpy_activity->linked = linked;
+  memcpy_activity->addMetadataQuoted(
+      "call", memoryCopyOperationName(activity->copy_kind));
+  memcpy_activity->addMetadata("device", memcpy_activity->deviceId());
+  memcpy_activity->addMetadataQuoted("context",
+                                     std::to_string(activity->context_id));
+  memcpy_activity->addMetadata("correlation", activity->correlation_id);
+  memcpy_activity->addMetadata("memory operation id", activity->copy_kind);
+  memcpy_activity->addMetadataQuoted("src rank",
+                                     p2pRankName(activity->src_device_id));
+  memcpy_activity->addMetadataQuoted("dst rank",
+                                     p2pRankName(activity->dst_device_id));
+  memcpy_activity->addMetadata("bytes", activity->bytes);
+  memcpy_activity->addMetadata("memory bandwidth (GB/s)", bandwidth(activity));
+  addCollMetadata(memcpy_activity, activity);
+
+  if (memcpy_activity->resource == getBaseResourceId(activity)) {
+    recordMemoryStream(memcpy_activity->device, memcpy_activity->resource,
+                       fmt::format("Memcpy ({}):", memoryCopyOperationName(
+                                                       activity->copy_kind)));
+  } else {
+    recordMemoryStream(memcpy_activity->device, memcpy_activity->resource, " ");
+  }
   memcpy_activity->log(*logger);
 }
 
@@ -725,6 +786,10 @@ void AiuptiActivityProfilerSession::handlePtiActivity(
     case (uint8_t)AIUPTI_ACTIVITY_KIND_MEMCPY:
       handleMemcpyActivity(
           reinterpret_cast<const AIUpti_ActivityMemcpy*>(record), logger);
+      break;
+    case (uint8_t)AIUPTI_ACTIVITY_KIND_MEMCPY2:
+      handleMemcpyPtoPActivity(
+          reinterpret_cast<const AIUpti_ActivityMemcpyPtoP*>(record), logger);
       break;
     case (uint8_t)AIUPTI_ACTIVITY_KIND_MEMSET:
       handleMemsetActivity(
