@@ -146,6 +146,26 @@ inline bool hasCyclesTs(const activity_type* activity) {
          activity->cycles_ts5 != 0;
 }
 
+// spyre-comms collective-invocation spans. Their AIUPTI correlation_id is the
+// collective ID from SpyreCommsContext::makeCollectiveId(), not a flex batch
+// ID; the two counters overlap numerically. The _SETUP spans carry no
+// collective ID and are deliberately not listed.
+inline bool isCollectiveSpanCbid(AIUpti_runtime_api_trace_cbid cbid) {
+  switch (cbid) {
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_ALLREDUCE:
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_ALLGATHER:
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_GATHER:
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_GATHERV:
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_REDUCE:
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_BROADCAST:
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_BARRIER:
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_REDUCE_SCATTER:
+      return true;
+    default:
+      return false;
+  }
+}
+
 inline std::string runtimeCbidName(AIUpti_runtime_api_trace_cbid cbid) {
   switch (cbid) {
     case AIUPTI_RUNTIME_TRACE_CBID_INVALID:
@@ -248,6 +268,8 @@ inline std::string runtimeCbidName(AIUpti_runtime_api_trace_cbid cbid) {
       return "aiuCommsCollBroadcast";
     case AIUPTI_RUNTIME_TRACE_CBID_COLL_BARRIER:
       return "aiuCommsCollBarrier";
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_REDUCE_SCATTER:
+      return "aiuCommsCollReduceScatter";
     case AIUPTI_RUNTIME_TRACE_CBID_WORK_SCHED_START:
       return "aiuCommsWorkSchedStart";
     case AIUPTI_RUNTIME_TRACE_CBID_WORK_SCHED_WAIT:
@@ -440,7 +462,14 @@ void AiuptiActivityProfilerSession::handleRuntimeActivity(
   runtime_activity->flow.type = libkineto::kLinkAsyncCpuGpu;
   runtime_activity->flow.start = flowStart;
   runtime_activity->linked = linked;
-  runtime_activity->addMetadata("correlation", activity->correlation_id);
+  // Report a collective span's ID as "collective_id" only: emitting it as
+  // "correlation" too would make it look related to the kernel/memcpy events
+  // that happen to share that number.
+  if (isCollectiveSpanCbid((AIUpti_runtime_api_trace_cbid)activity->cbid)) {
+    runtime_activity->addMetadata("collective_id", activity->correlation_id);
+  } else {
+    runtime_activity->addMetadata("correlation", activity->correlation_id);
+  }
 
   if (activity->cbid == AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_TO_HARDWARE &&
       !calibration && linked && linked->deviceId() == activity->process_id &&
