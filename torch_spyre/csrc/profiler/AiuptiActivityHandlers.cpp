@@ -371,7 +371,11 @@ inline std::string fixedCharField(const char (&field)[N]) {
 // coll_algo only from a structured "[Coll,Algo,Bytes]" label, whose fields are
 // all required, so a non-empty coll_algo means coll_bytes was really parsed.
 // On collective records coll_bytes is therefore the number when known
-// (including a real 0) and "" when the label carried no size.
+// (including a real 0) and "" when the label carried no size. coll_id is the
+// spyre-comms collective ID from a "[Coll,Algo,Bytes,CollId]" label; 0 is a
+// valid ID, so has_coll_id says whether it was set. It is emitted under the
+// same "collective_id" key as the collective host spans, so device events can
+// be joined to the collective invocation that issued them.
 
 template <class T, class = void>
 struct HasCollFields : std::false_type {};
@@ -381,9 +385,23 @@ struct HasCollFields<T, std::void_t<decltype(std::declval<T&>().coll_group),
                                     decltype(std::declval<T&>().coll_bytes)>>
     : std::true_type {};
 
+// coll_id is newer than the other coll fields, so it is detected separately and
+// older libaiupti headers still get coll_group/coll_algo/coll_bytes.
+template <class T, class = void>
+struct HasCollIdFields : std::false_type {};
+template <class T>
+struct HasCollIdFields<T, std::void_t<decltype(std::declval<T&>().coll_id),
+                                      decltype(std::declval<T&>().has_coll_id)>>
+    : std::true_type {};
+
 template <class trace_activity_type, class aiupti_activity_type>
 inline void addCollMetadata(trace_activity_type& trace_activity,
                             const aiupti_activity_type* activity) {
+  if constexpr (HasCollIdFields<aiupti_activity_type>::value) {
+    if (activity->has_coll_id != 0) {
+      trace_activity->addMetadata("collective_id", activity->coll_id);
+    }
+  }
   if constexpr (HasCollFields<aiupti_activity_type>::value) {
     if (activity->coll_group[0] != '\0') {
       trace_activity->addMetadataQuoted("coll_group",
