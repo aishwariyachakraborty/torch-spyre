@@ -319,10 +319,17 @@ inline std::string fixedCharField(const char (&field)[N]) {
 // coll_algo only from a structured "[Coll,Algo,Bytes]" label, whose fields are
 // all required, so a non-empty coll_algo means coll_bytes was really parsed.
 // On collective records coll_bytes is therefore the number when known
-// (including a real 0) and "" when the label carried no size.
+// (including a real 0) and "" when the label carried no size. coll_id is the
+// spyre-comms collective ID from a "[Coll,Algo,Bytes,CollId]" label; 0 is a
+// valid ID, so has_coll_id says whether it was set. It is emitted under the
+// same "collective_id" key as the collective host spans, so device events can
+// be joined to the collective invocation that issued them.
 template <class trace_activity_type, class aiupti_activity_type>
 inline void addCollMetadata(trace_activity_type& trace_activity,
                             const aiupti_activity_type* activity) {
+  if (activity->has_coll_id != 0) {
+    trace_activity->addMetadata("collective_id", activity->coll_id);
+  }
   if (activity->coll_group[0] != '\0') {
     trace_activity->addMetadataQuoted("coll_group",
                                       fixedCharField(activity->coll_group));
