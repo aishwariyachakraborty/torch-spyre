@@ -791,6 +791,11 @@ void AiuptiActivityProfilerSession::handleMemcpyPtoPActivity(
                                      p2pRankName(activity->dst_device_id));
   memcpy_activity->addMetadata("bytes", activity->bytes);
   memcpy_activity->addMetadata("memory bandwidth (GB/s)", bandwidth(activity));
+  // flex fills these from the RDMA control block's response; omit the key when
+  // the device left every slot 0, as for the other Memcpy records.
+  if (hasCyclesTs(activity)) {
+    memcpy_activity->addMetadata("cycles_ts", cyclesTsJson(activity));
+  }
   addCollMetadata(memcpy_activity, activity);
 
   if (memcpy_activity->resource == getBaseResourceId(activity)) {
