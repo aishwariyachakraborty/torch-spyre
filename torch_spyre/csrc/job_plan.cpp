@@ -16,6 +16,7 @@
 
 #include "job_plan.h"
 
+#include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -28,11 +29,33 @@
 
 namespace spyre {
 
+namespace {
+
+// SPYRE_H2D_COMPUTE_PIPELINE=1 submits job-plan H2D uploads on flex's COMPUTE
+// pipeline instead of ASYNC_DMAI. On a STRICT_ORDERING stream, switching from
+// COMPUTE (kernels, collectives) to DMAI makes flex host-wait every in-flight
+// COMPUTE fence before submitting the H2D (AfRuntimeScheduler::issueBarrier),
+// which leaves the device idle until the previous op's completion callback
+// runs. Staying on COMPUTE keeps per-stream FIFO ordering in hardware, at the
+// cost of serialising the upload behind earlier compute. Off by default.
+bool h2dUsesComputePipeline() {
+  static const bool enabled = [] {
+    const char* v = std::getenv("SPYRE_H2D_COMPUTE_PIPELINE");
+    if (v == nullptr) return false;
+    const std::string s(v);
+    return s == "1" || s == "true" || s == "t" || s == "yes" || s == "y";
+  }();
+  return enabled;
+}
+
+}  // namespace
+
 void JobPlanStepH2D::construct(LaunchContext&,
                                const SpyreStream& stream) const {
-  auto* params =
-      flex::createDmaParams(host_address_, device_address_.total_size(),
-                            /*to_device=*/true, &device_address_);
+  auto* params = flex::createDmaParams(
+      host_address_, device_address_.total_size(),
+      /*to_device=*/true, &device_address_, /*dci=*/nullptr, /*iova=*/nullptr,
+      /*use_compute_pipeline=*/h2dUsesComputePipeline());
   params->pipeline_barrier = pipeline_barrier_;
   stream.launchH2D(params);
   flex::destroyDmaParams(params);
@@ -210,9 +233,10 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
   }
 
   // Create DmaParams to transfer the host buffer.
-  auto* dma_params =
-      flex::createDmaParams(host_buffer->data(), host_buffer->size(),
-                            /*to_device=*/true, &device_address_);
+  auto* dma_params = flex::createDmaParams(
+      host_buffer->data(), host_buffer->size(),
+      /*to_device=*/true, &device_address_, /*dci=*/nullptr, /*iova=*/nullptr,
+      /*use_compute_pipeline=*/h2dUsesComputePipeline());
   dma_params->pipeline_barrier = pipeline_barrier_;
   // The managed buffer is freed when the callback is destroyed, which happens
   // after the DMA completes or is cancelled.
